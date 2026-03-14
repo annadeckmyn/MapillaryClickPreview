@@ -13,5 +13,7 @@ deprecated=False
 category=Web
 icon=icon.svg
 tags=mapillary,vector tiles,imagery,web
+homepage=https://github.com/annadeckmyn/MapillaryClickPreview
 repository=https://github.com/annadeckmyn/MapillaryClickPreview
+tracker=https://github.com/annadeckmyn/MapillaryClickPreview
 changelog=Qt6 fixes; adds menu action to create a Vector Tile layer (mly1_public) using token from QgsSettings.
