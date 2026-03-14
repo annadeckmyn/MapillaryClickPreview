@@ -1,19 +1,19 @@
 
 [general]
 name=MapillaryClickPreview
-qgisMinimumVersion=3.28
+description=Click-to-preview nearest Mapillary image and add Mapillary coverage as vector tiles.
+qgisMinimumVersion=4.0
 qgisMaximumVersion=4.99
-version=1.0.0
-author=Anna Deckmyn (via Copilot)
+version=1.1.1
+author=Anna Deckmyn
 email=
-about=Toggle tool to fetch and preview the nearest Mapillary image by clicking on the map canvas.
+about=Toggle tool to fetch and preview the nearest Mapillary image by clicking on the map canvas. Includes an action to add Mapillary coverage vector tiles (mly1_public).
 experimental=False
+deprecated=False
 category=Web
 icon=icon.svg
+tags=mapillary,vector tiles,imagery,web
 homepage=
 tracker=
 repository=
-
-[help]
-
-changelog=Qt6 fix: use QDialogButtonBox.StandardButton.Ok/Cancel constants.
+changelog=Qt6 fixes; adds menu action to create a Vector Tile layer (mly1_public) using token from QgsSettings.
