@@ -2,16 +2,21 @@
 # -*- coding: utf-8 -*-
 # QGIS Plugin: Mapillary Click Preview (toggle button + add coverage VTP layer)
 
+import json
 import os
+from datetime import datetime, timezone
 from qgis.PyQt.QtCore import Qt
 from qgis.PyQt.QtGui import QIcon
-from qgis.PyQt.QtWidgets import QAction, QDialog, QFormLayout, QLineEdit, QDialogButtonBox
-from qgis.core import QgsSettings, QgsProject, QgsVectorTileLayer
+from qgis.PyQt.QtWidgets import (
+    QAction, QCheckBox, QDialog, QDialogButtonBox, QFormLayout, QLineEdit, QSpinBox,
+)
+from qgis.core import QgsSettings, QgsProject, QgsVectorTileBasicRenderer, QgsVectorTileLayer
 
 from . import mapillary_click_tool as tool
 
 
 TILES_TEMPLATE = 'https://tiles.mapillary.com/maps/vtp/mly1_public/2/{{z}}/{{x}}/{{y}}?access_token={token}'
+MAPILLARY_LAUNCH_YEAR = 2012
 
 
 class TokenDialog(QDialog):
@@ -41,12 +46,67 @@ class TokenDialog(QDialog):
         self.accept()
 
 
+def _build_year_filter_expr(from_year, to_year):
+    """QGIS expression that filters VT image features by captured_at year range.
+    Features without captured_at (sequences, overviews) are always passed through."""
+    start_ms = int(datetime(from_year, 1, 1, tzinfo=timezone.utc).timestamp() * 1000)
+    end_ms = int(datetime(to_year + 1, 1, 1, tzinfo=timezone.utc).timestamp() * 1000) - 1
+    return f'captured_at IS NULL OR (captured_at >= {start_ms} AND captured_at <= {end_ms})'
+
+
+class YearFilterDialog(QDialog):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle('Filter: Captured At (Year Range)')
+        layout = QFormLayout(self)
+
+        current_year = datetime.now().year
+        s = QgsSettings()
+        enabled = s.value('mapillary/year_filter_enabled', False, type=bool)
+        from_year = s.value('mapillary/year_filter_from', MAPILLARY_LAUNCH_YEAR, type=int)
+        to_year = s.value('mapillary/year_filter_to', current_year, type=int)
+
+        self.enabled_check = QCheckBox('Enable year filter', self)
+        self.enabled_check.setChecked(enabled)
+        layout.addRow(self.enabled_check)
+
+        self.from_spin = QSpinBox(self)
+        self.from_spin.setRange(MAPILLARY_LAUNCH_YEAR, current_year)
+        self.from_spin.setValue(max(MAPILLARY_LAUNCH_YEAR, min(from_year, current_year)))
+        layout.addRow('From year:', self.from_spin)
+
+        self.to_spin = QSpinBox(self)
+        self.to_spin.setRange(MAPILLARY_LAUNCH_YEAR, current_year)
+        self.to_spin.setValue(max(MAPILLARY_LAUNCH_YEAR, min(to_year, current_year)))
+        layout.addRow('To year:', self.to_spin)
+
+        self.buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel,
+            parent=self
+        )
+        self.buttons.accepted.connect(self._on_accept)
+        self.buttons.rejected.connect(self.reject)
+        layout.addRow(self.buttons)
+
+    def _on_accept(self):
+        from_year = self.from_spin.value()
+        to_year = self.to_spin.value()
+        if from_year > to_year:
+            from_year, to_year = to_year, from_year
+        s = QgsSettings()
+        s.setValue('mapillary/year_filter_enabled', self.enabled_check.isChecked())
+        s.setValue('mapillary/year_filter_from', from_year)
+        s.setValue('mapillary/year_filter_to', to_year)
+        self.accept()
+
+
 class MapillaryClickPreviewPlugin:
     def __init__(self, iface):
         self.iface = iface
         self.action = None
         self.settings_action = None
         self.add_tiles_action = None
+        self.filter_year_action = None
 
     def initGui(self):
         icon_path = os.path.join(os.path.dirname(__file__), 'icon.svg')
@@ -68,6 +128,10 @@ class MapillaryClickPreviewPlugin:
         self.iface.addPluginToMenu('&Mapillary', self.settings_action)
         self.iface.addPluginToMenu('&Mapillary', self.add_tiles_action)
 
+        self.filter_year_action = QAction('Filter Mapillary Coverage by Year…', self.iface.mainWindow())
+        self.filter_year_action.triggered.connect(self._open_year_filter)
+        self.iface.addPluginToMenu('&Mapillary', self.filter_year_action)
+
     def unload(self):
         try:
             if self.action:
@@ -77,6 +141,8 @@ class MapillaryClickPreviewPlugin:
                 self.iface.removePluginMenu('&Mapillary', self.settings_action)
             if self.add_tiles_action:
                 self.iface.removePluginMenu('&Mapillary', self.add_tiles_action)
+            if self.filter_year_action:
+                self.iface.removePluginMenu('&Mapillary', self.filter_year_action)
         except Exception:
             pass
 
@@ -101,6 +167,59 @@ class MapillaryClickPreviewPlugin:
         dlg.setModal(True)
         dlg.exec()
 
+    def _open_year_filter(self):
+        dlg = YearFilterDialog(self.iface.mainWindow())
+        dlg.setModal(True)
+        if dlg.exec() == QDialog.DialogCode.Accepted:
+            self._apply_year_filter_to_existing_layers()
+
+    def _apply_year_filter_to_existing_layers(self):
+        s = QgsSettings()
+        enabled = s.value('mapillary/year_filter_enabled', False, type=bool)
+        year_expr = ''
+        if enabled:
+            from_year = s.value('mapillary/year_filter_from', MAPILLARY_LAUNCH_YEAR, type=int)
+            to_year = s.value('mapillary/year_filter_to', datetime.now().year, type=int)
+            year_expr = _build_year_filter_expr(from_year, to_year)
+
+        _ORIG_KEY = 'mapillary_year_filter_originals'
+        for layer in QgsProject.instance().mapLayers().values():
+            if not (isinstance(layer, QgsVectorTileLayer) and layer.name() == 'Mapillary Coverage (mly1_public)'):
+                continue
+            renderer = layer.renderer()
+            if not isinstance(renderer, QgsVectorTileBasicRenderer):
+                continue
+            if hasattr(renderer, 'styles'):
+                rules = renderer.styles()
+            else:
+                rules = renderer.rules()
+
+            # Persist original (pre-filter) rule expressions on first encounter
+            saved_raw = layer.customProperty(_ORIG_KEY)
+            if saved_raw:
+                try:
+                    originals = json.loads(saved_raw)
+                except Exception:
+                    originals = [r.filterExpression() for r in rules]
+                    layer.setCustomProperty(_ORIG_KEY, json.dumps(originals))
+            else:
+                originals = [r.filterExpression() for r in rules]
+                layer.setCustomProperty(_ORIG_KEY, json.dumps(originals))
+
+            for i, rule in enumerate(rules):
+                base = originals[i] if i < len(originals) else ''
+                if year_expr:
+                    new_filter = f'({base}) AND ({year_expr})' if base else year_expr
+                else:
+                    new_filter = base
+                rule.setFilterExpression(new_filter)
+
+            if hasattr(renderer, 'setStyles'):
+                renderer.setStyles(rules)
+            else:
+                renderer.setRules(rules)
+            layer.triggerRepaint()
+
     def _add_vector_tiles_layer(self):
         s = QgsSettings()
         token = s.value('mapillary/access_token', '', type=str).strip()
@@ -122,3 +241,4 @@ class MapillaryClickPreviewPlugin:
             QgsMessageLog.logMessage('Failed to create Mapillary coverage vector tile layer. Check URL/token.', 'Mapillary', Qgis.Critical)
             return
         QgsProject.instance().addMapLayer(vtl)
+        self._apply_year_filter_to_existing_layers()

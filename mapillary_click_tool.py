@@ -82,6 +82,16 @@ def build_point_query_url(lon, lat, radius_m, limit=QUERY_LIMIT):
         f'bbox={min_lon},{min_lat},{max_lon},{max_lat}',
         f'limit={limit}',
     ]
+    if _qsettings.value('mapillary/year_filter_enabled', False, type=bool):
+        from_year = _qsettings.value('mapillary/year_filter_from', 2012, type=int)
+        to_year = _qsettings.value('mapillary/year_filter_to', datetime.now().year, type=int)
+        from_year, to_year = min(from_year, to_year), max(from_year, to_year)
+        params.append(
+            f'start_captured_at={datetime(from_year, 1, 1, tzinfo=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")}'
+        )
+        params.append(
+            f'end_captured_at={datetime(to_year, 12, 31, 23, 59, 59, tzinfo=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")}'
+        )
     return base + '?' + '&'.join(params)
 
 
