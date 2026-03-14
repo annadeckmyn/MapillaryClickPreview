@@ -1,22 +1,26 @@
 
 # -*- coding: utf-8 -*-
-# PyQGIS tool: click on the map and fetch the nearest Mapillary image on demand
-# Exposes: activate_click_tool(), deactivate_click_tool(show_message=True)
+# PyQGIS tool: click on the map and fetch Mapillary image by feature id on demand
+# Exposes: activate_click_tool(), deactivate_click_tool(show_message=True),
+#          preview_selected_feature(), enable_auto_identify_preview(), disable_auto_identify_preview()
 
 from datetime import datetime, timezone
-from math import asin, cos, radians, sin, sqrt
 import json
 import urllib.error
 import urllib.request
 
-from qgis.PyQt.QtCore import Qt
+from qgis.PyQt.QtCore import QEvent, QObject, Qt
 from qgis.PyQt.QtGui import QPixmap
 from qgis.PyQt.QtWidgets import QDockWidget, QLabel, QVBoxLayout, QWidget
 from qgis.core import (
-    QgsCoordinateReferenceSystem,
     QgsCoordinateTransform,
+    QgsFeatureRequest,
+    QgsGeometry,
+    QgsPointXY,
     QgsProject,
+    QgsRectangle,
     QgsSettings,
+    QgsVectorLayer,
 )
 from qgis.gui import QgsMapToolEmitPoint
 from qgis.utils import iface
@@ -24,14 +28,52 @@ from qgis.utils import iface
 _qsettings = QgsSettings()
 ACCESS_TOKEN = _qsettings.value('mapillary/access_token', '', type=str).strip()
 
-SEARCH_RADIUS_M = 5
-QUERY_LIMIT = 200
+MAPILLARY_IMAGE_LAYER_NAME = 'Mapillary image'
+MAPILLARY_ID_FIELD = 'id'
+FEATURE_PICK_TOLERANCE_PX = 8
 THUMB_MAX_W, THUMB_MAX_H = 900, 600
 
 canvas = None
 project = None
-to_wgs84 = None
 preview = None
+
+
+class _MapillaryIdentifyClickFilter(QObject):
+    def eventFilter(self, watched, event):
+        try:
+            if event.type() != QEvent.Type.MouseButtonRelease:
+                return False
+            if event.button() != Qt.MouseButton.LeftButton:
+                return False
+            if not _is_identify_tool_active():
+                return False
+
+            click_tool = globals().get('_MAPILLARY_CLICK_TOOL')
+            if click_tool is not None and canvas is not None:
+                try:
+                    if canvas.mapTool() == click_tool:
+                        return False
+                except Exception:
+                    pass
+
+            map_point = _mouse_event_to_map_point(event)
+            if map_point is None:
+                return False
+
+            try:
+                image_id = _find_clicked_image_id(map_point)
+            except Exception:
+                return False
+
+            _ensure_infrastructure()
+            preview['status_label'].setText(f'Identify: Mapillary image {image_id} gevonden...')
+            preview['meta_label'].setText('')
+            preview['link_label'].setText('')
+            _fetch_and_render_image_id(image_id)
+        except Exception:
+            return False
+
+        return False
 
 
 def fetch_json(url):
@@ -47,86 +89,255 @@ def timestamp_ms_to_year(timestamp_ms):
             return None
         return datetime.fromtimestamp(ts_ms / 1000.0, tz=timezone.utc).year
     except (TypeError, ValueError, OSError, OverflowError):
-        return None
+        pass
+
+    if isinstance(timestamp_ms, str):
+        value = timestamp_ms.strip()
+        if value:
+            if value.endswith('Z'):
+                value = value[:-1] + '+00:00'
+            try:
+                return datetime.fromisoformat(value).year
+            except ValueError:
+                pass
+
+    return None
 
 
-def haversine_m(lon1, lat1, lon2, lat2):
-    earth_radius_m = 6371000.0
-    dlon = radians(lon2 - lon1)
-    dlat = radians(lat2 - lat1)
-    a = sin(dlat / 2.0) ** 2 + cos(radians(lat1)) * cos(radians(lat2)) * sin(dlon / 2.0) ** 2
-    c = 2.0 * asin(min(1.0, sqrt(a)))
-    return earth_radius_m * c
-
-
-def build_point_query_url(lon, lat, radius_m, limit=QUERY_LIMIT):
+def _ensure_access_token():
     global ACCESS_TOKEN
     if not ACCESS_TOKEN:
         ACCESS_TOKEN = _qsettings.value('mapillary/access_token', '', type=str).strip()
     if not ACCESS_TOKEN:
         raise RuntimeError("Geen Mapillary access token gevonden. Zet via Plugins → Mapillary → Mapillary Token… of Settings → Options → Advanced → 'mapillary/access_token'.")
+    return ACCESS_TOKEN
 
-    lat_delta = radius_m / 111320.0
-    cos_lat = max(0.01, abs(cos(radians(lat))))
-    lon_delta = radius_m / (111320.0 * cos_lat)
 
-    min_lon = lon - lon_delta
-    min_lat = lat - lat_delta
-    max_lon = lon + lon_delta
-    max_lat = lat + lat_delta
+def build_image_query_url(image_id):
+    token = _ensure_access_token()
+    image_id_str = str(image_id).strip()
+    if not image_id_str:
+        raise RuntimeError('Geen geldige Mapillary image id ontvangen.')
 
-    base = 'https://graph.mapillary.com/images'
+    base = f'https://graph.mapillary.com/{image_id_str}'
     params = [
-        f'access_token={ACCESS_TOKEN}',
+        f'access_token={token}',
         'fields=id,computed_geometry,compass_angle,captured_at,is_pano,creator{id},thumb_1024_url',
-        f'bbox={min_lon},{min_lat},{max_lon},{max_lat}',
-        f'limit={limit}',
     ]
-    if _qsettings.value('mapillary/year_filter_enabled', False, type=bool):
-        from_year = _qsettings.value('mapillary/year_filter_from', 2012, type=int)
-        to_year = _qsettings.value('mapillary/year_filter_to', datetime.now().year, type=int)
-        from_year, to_year = min(from_year, to_year), max(from_year, to_year)
-        params.append(
-            f'start_captured_at={datetime(from_year, 1, 1, tzinfo=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")}'
-        )
-        params.append(
-            f'end_captured_at={datetime(to_year, 12, 31, 23, 59, 59, tzinfo=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")}'
-        )
     return base + '?' + '&'.join(params)
 
 
-def find_nearest_image(lon, lat):
-    url = build_point_query_url(lon, lat, radius_m=SEARCH_RADIUS_M, limit=QUERY_LIMIT)
-    data = fetch_json(url)
-    items = data.get('data', []) or []
+def _ensure_canvas_project():
+    global canvas, project
 
-    nearest = None
-    for it in items:
-        geom = it.get('computed_geometry') or {}
-        coords = geom.get('coordinates') or []
-        if len(coords) < 2:
+    if canvas is None:
+        canvas = iface.mapCanvas()
+    if project is None:
+        project = QgsProject.instance()
+
+
+def _is_identify_tool_active():
+    try:
+        action = iface.actionIdentify()
+        return bool(action and action.isChecked())
+    except Exception:
+        return False
+
+
+def _mouse_event_to_map_point(event):
+    _ensure_canvas_project()
+
+    try:
+        if hasattr(event, 'position'):
+            pos = event.position()
+            px = int(round(pos.x()))
+            py = int(round(pos.y()))
+        else:
+            pos = event.pos()
+            px = int(pos.x())
+            py = int(pos.y())
+        return canvas.getCoordinateTransform().toMapCoordinates(px, py)
+    except Exception:
+        return None
+
+
+def enable_auto_identify_preview():
+    _ensure_canvas_project()
+
+    if globals().get('_MAPILLARY_IDENTIFY_FILTER') is not None:
+        return
+
+    identify_filter = _MapillaryIdentifyClickFilter(canvas.viewport())
+    canvas.viewport().installEventFilter(identify_filter)
+    globals()['_MAPILLARY_IDENTIFY_FILTER'] = identify_filter
+
+
+def disable_auto_identify_preview():
+    identify_filter = globals().get('_MAPILLARY_IDENTIFY_FILTER')
+    if identify_filter is None:
+        return
+
+    try:
+        if canvas is not None:
+            canvas.viewport().removeEventFilter(identify_filter)
+    except Exception:
+        pass
+
+    globals()['_MAPILLARY_IDENTIFY_FILTER'] = None
+
+
+def _transform_point(point_xy, source_crs, dest_crs):
+    _ensure_canvas_project()
+
+    if source_crs == dest_crs:
+        return QgsPointXY(point_xy.x(), point_xy.y())
+
+    xform = QgsCoordinateTransform(source_crs, dest_crs, project.transformContext())
+    return xform.transform(point_xy)
+
+
+def _find_mapillary_image_layer():
+    _ensure_canvas_project()
+
+    for layer in project.mapLayers().values():
+        if isinstance(layer, QgsVectorLayer) and layer.isValid() and layer.name() == MAPILLARY_IMAGE_LAYER_NAME:
+            return layer
+    return None
+
+
+def _get_layer_and_id_index():
+    layer = _find_mapillary_image_layer()
+    if layer is None:
+        raise RuntimeError("Layer 'Mapillary image' niet gevonden. Laad eerst Mapillary Coverage.")
+
+    id_index = layer.fields().indexOf(MAPILLARY_ID_FIELD)
+    if id_index < 0:
+        raise RuntimeError("Kolom 'id' ontbreekt in laag 'Mapillary image'.")
+
+    return layer, id_index
+
+
+def _normalize_image_id(raw_value):
+    if raw_value is None:
+        return ''
+    return str(raw_value).strip()
+
+
+def _selected_image_id_or_error(layer, id_index):
+    selected = layer.selectedFeatures()
+    if not selected:
+        raise RuntimeError("Geen feature geselecteerd in laag 'Mapillary image'.")
+
+    image_id = _normalize_image_id(selected[-1][id_index])
+    if not image_id:
+        raise RuntimeError("Geselecteerde feature heeft geen geldige 'id'.")
+
+    return image_id
+
+
+def _find_clicked_image_id(map_point):
+    _ensure_canvas_project()
+
+    layer, id_index = _get_layer_and_id_index()
+
+    layer_point = _transform_point(map_point, project.crs(), layer.crs())
+
+    tolerance_project = max(float(canvas.mapUnitsPerPixel()) * FEATURE_PICK_TOLERANCE_PX, 0.0)
+    if tolerance_project <= 0:
+        tolerance_project = 1.0
+
+    dx_point = _transform_point(
+        QgsPointXY(map_point.x() + tolerance_project, map_point.y()),
+        project.crs(),
+        layer.crs(),
+    )
+    dy_point = _transform_point(
+        QgsPointXY(map_point.x(), map_point.y() + tolerance_project),
+        project.crs(),
+        layer.crs(),
+    )
+
+    tolerance_layer = max(abs(dx_point.x() - layer_point.x()), abs(dy_point.y() - layer_point.y()))
+    if tolerance_layer <= 0:
+        tolerance_layer = tolerance_project
+
+    search_rect = QgsRectangle(
+        layer_point.x() - tolerance_layer,
+        layer_point.y() - tolerance_layer,
+        layer_point.x() + tolerance_layer,
+        layer_point.y() + tolerance_layer,
+    )
+
+    request = QgsFeatureRequest().setFilterRect(search_rect)
+    request.setSubsetOfAttributes([id_index])
+
+    click_geom = QgsGeometry.fromPointXY(layer_point)
+    nearest_id = None
+    nearest_dist = None
+
+    for feature in layer.getFeatures(request):
+        feature_id = _normalize_image_id(feature[id_index])
+        if not feature_id:
             continue
 
-        img_lon = float(coords[0])
-        img_lat = float(coords[1])
-        dist_m = haversine_m(lon, lat, img_lon, img_lat)
+        geom = feature.geometry()
+        if geom is None or geom.isEmpty():
+            continue
 
-        if nearest is None or dist_m < nearest['distance_m']:
-            pid = str(it.get('id') or '')
-            nearest = {
-                'id': pid,
-                'captured_at': timestamp_ms_to_year(it.get('captured_at')),
-                'compass': float(it.get('compass_angle') or 0.0),
-                'is_pano': bool(it.get('is_pano') or False),
-                'creator_id': str((it.get('creator') or {}).get('id') or ''),
-                'thumb_url': str(it.get('thumb_1024_url') or ''),
-                'url': f'https://www.mapillary.com/app/?pKey={pid}&focus=photo',
-                'distance_m': dist_m,
-                'search_radius_m': SEARCH_RADIUS_M,
-                'candidate_count': len(items),
-            }
+        dist = geom.distance(click_geom)
+        if nearest_id is None or dist < nearest_dist:
+            nearest_id = feature_id
+            nearest_dist = dist
 
-    return nearest
+    if nearest_id is None or nearest_dist is None or nearest_dist > tolerance_layer:
+        raise RuntimeError(f'Geen Mapillary feature gevonden binnen {FEATURE_PICK_TOLERANCE_PX} px van de klik.')
+
+    return nearest_id
+
+
+def fetch_image_by_id(image_id):
+    data = fetch_json(build_image_query_url(image_id))
+    if not isinstance(data, dict):
+        raise RuntimeError('Onverwachte API-respons voor Mapillary image id.')
+
+    pid = str(data.get('id') or image_id)
+    return {
+        'id': pid,
+        'captured_at': timestamp_ms_to_year(data.get('captured_at')),
+        'compass': float(data.get('compass_angle') or 0.0),
+        'is_pano': bool(data.get('is_pano') or False),
+        'creator_id': str((data.get('creator') or {}).get('id') or ''),
+        'thumb_url': str(data.get('thumb_1024_url') or ''),
+        'url': f'https://www.mapillary.com/app/?pKey={pid}&focus=photo',
+    }
+
+
+def _set_fallback_link(image_id):
+    preview['link_label'].setText(
+        f'<a href="https://www.mapillary.com/app/?pKey={image_id}&focus=photo">Open in Mapillary</a>'
+    )
+
+
+def _fetch_and_render_image_id(image_id):
+    preview['status_label'].setText(f'Mapillary image {image_id} ophalen...')
+
+    try:
+        result = fetch_image_by_id(image_id)
+    except urllib.error.HTTPError as exc:
+        err_text = ''
+        try:
+            err_text = exc.read().decode('utf-8', errors='ignore')
+        except Exception:
+            err_text = str(exc)
+        set_preview_empty(preview, f'HTTP fout {exc.code}: {err_text[:300]}')
+        _set_fallback_link(image_id)
+        return
+    except Exception as exc:
+        set_preview_empty(preview, f'Fout bij ophalen Mapillary image {image_id}: {exc}')
+        _set_fallback_link(image_id)
+        return
+
+    set_preview_result(preview, result)
 
 
 def fetch_pixmap_from_url(url):
@@ -159,7 +370,7 @@ def create_preview_panel():
     layout = QVBoxLayout(container)
     layout.setContentsMargins(8, 8, 8, 8)
 
-    status_label = QLabel('Links klikken: dichtstbijzijnde Mapillary foto ophalen. Rechterklik: click-only mode stoppen.')
+    status_label = QLabel("Klik/selecteer/identify een Mapillary image-feature om direct preview te laden. Rechterklik: click-only mode stoppen.")
     status_label.setWordWrap(True)
     layout.addWidget(status_label)
 
@@ -200,12 +411,12 @@ def set_preview_empty(preview_panel, status_text):
 
 
 def set_preview_result(preview_panel, result):
-    preview_panel['status_label'].setText(
-        f"Gevonden binnen {result['search_radius_m']} m (kandidaten: {result['candidate_count']})."
-    )
+    preview_panel['status_label'].setText('Mapillary foto opgehaald op basis van id uit de laag.')
+    year = result.get('captured_at')
+    year_text = str(year) if year is not None else 'onbekend'
     preview_panel['meta_label'].setText(
-        f"ID: {result['id']} | Jaar: {result['captured_at']} | Kompas: {result['compass']:.1f}° "
-        f"| Pano: {result['is_pano']} | Afstand: {result['distance_m']:.1f} m"
+        f"ID: {result['id']} | Jaar: {year_text} | Kompas: {result['compass']:.1f}° "
+        f"| Pano: {result['is_pano']}"
     )
 
     pix = fetch_pixmap_from_url(result['thumb_url'])
@@ -228,18 +439,9 @@ def set_preview_result(preview_panel, result):
 
 
 def _ensure_infrastructure():
-    global canvas, project, to_wgs84, preview
+    global preview
 
-    if canvas is None:
-        canvas = iface.mapCanvas()
-    if project is None:
-        project = QgsProject.instance()
-
-    if to_wgs84 is None:
-        transform_ctx = project.transformContext()
-        project_crs = project.crs()
-        wgs84 = QgsCoordinateReferenceSystem('EPSG:4326')
-        to_wgs84 = QgsCoordinateTransform(project_crs, wgs84, transform_ctx)
+    _ensure_canvas_project()
 
     if preview is None:
         preview = create_preview_panel()
@@ -296,37 +498,34 @@ def on_canvas_clicked(map_point, mouse_button):
 
     _ensure_infrastructure()
 
-    try:
-        point_wgs84 = to_wgs84.transform(map_point)
-        lon = float(point_wgs84.x())
-        lat = float(point_wgs84.y())
-    except Exception as exc:
-        set_preview_empty(preview, f'Kon klikpunt niet transformeren naar WGS84: {exc}')
-        return
-
-    preview['status_label'].setText(f'Zoeken rond klikpunt lon={lon:.6f}, lat={lat:.6f}...')
+    preview['status_label'].setText("Mapillary feature-id zoeken in laag 'Mapillary image'...")
     preview['meta_label'].setText('')
     preview['link_label'].setText('')
 
     try:
-        nearest = find_nearest_image(lon, lat)
-    except urllib.error.HTTPError as exc:
-        err_text = ''
-        try:
-            err_text = exc.read().decode('utf-8', errors='ignore')
-        except Exception:
-            err_text = str(exc)
-        set_preview_empty(preview, f'HTTP fout {exc.code}: {err_text[:300]}')
-        return
+        image_id = _find_clicked_image_id(map_point)
     except Exception as exc:
-        set_preview_empty(preview, f'Fout bij ophalen Mapillary data: {exc}')
+        set_preview_empty(preview, f'Kon geen bruikbare id uit laag \"Mapillary image\" lezen: {exc}')
         return
 
-    if nearest is None:
-        set_preview_empty(preview, f'Geen Mapillary foto gevonden binnen {SEARCH_RADIUS_M} m van het klikpunt.')
+    _fetch_and_render_image_id(image_id)
+
+
+def preview_selected_feature():
+    _ensure_infrastructure()
+
+    preview['status_label'].setText("Geselecteerde feature lezen uit laag 'Mapillary image'...")
+    preview['meta_label'].setText('')
+    preview['link_label'].setText('')
+
+    try:
+        layer, id_index = _get_layer_and_id_index()
+        image_id = _selected_image_id_or_error(layer, id_index)
+    except Exception as exc:
+        set_preview_empty(preview, f'Kan geselecteerde feature niet gebruiken: {exc}')
         return
 
-    set_preview_result(preview, nearest)
+    _fetch_and_render_image_id(image_id)
 
 
 def activate_click_tool():
@@ -359,7 +558,7 @@ def activate_click_tool():
     canvas.setMapTool(click_tool)
 
     if preview is not None:
-        preview['status_label'].setText('Click-only mode actief. Links klikken: zoeken. Rechterklik: stoppen en vorig tool herstellen.')
+        preview['status_label'].setText("Click-only mode actief. Klik op een Mapillary image-feature (of gebruik Preview Selected). Rechterklik: stoppen en vorig tool herstellen.")
 
     globals()['_MAPILLARY_CLICK_TOOL'] = click_tool
     globals()['_MAPILLARY_CLICK_HANDLER'] = on_canvas_clicked

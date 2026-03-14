@@ -125,8 +125,7 @@ class TokenDialog(QDialog):
 
 
 def _build_year_filter_expr(from_year, to_year):
-    """QGIS expression that filters VT image features by captured_at year range.
-    Features without captured_at (sequences, overviews) are always passed through."""
+    """QGIS expression that filters coverage features by captured_at year range."""
     start_ms = int(datetime(from_year, 1, 1, tzinfo=timezone.utc).timestamp() * 1000)
     end_ms = int(datetime(to_year + 1, 1, 1, tzinfo=timezone.utc).timestamp() * 1000) - 1
     return f'captured_at IS NULL OR (captured_at >= {start_ms} AND captured_at <= {end_ms})'
@@ -190,6 +189,7 @@ class MapillaryClickPreviewPlugin:
         self.coverage_range_key = None
         self.coverage_layers = {level: None for level in LAYER_LEVELS}
         self.coverage_refreshing = False
+        self._auto_preview_layer = None
 
     def initGui(self):
         icon_path = os.path.join(os.path.dirname(__file__), 'icon.svg')
@@ -222,6 +222,11 @@ class MapillaryClickPreviewPlugin:
         self.iface.addPluginToMenu('&Mapillary', self.filter_year_action)
 
         try:
+            tool.enable_auto_identify_preview()
+        except Exception as e:
+            QgsMessageLog.logMessage(f'Could not enable auto identify preview: {e}', 'Mapillary', Qgis.Warning)
+
+        try:
             self.iface.mapCanvas().mapCanvasRefreshed.connect(self._refresh_coverage_for_canvas)
         except Exception:
             pass
@@ -252,6 +257,11 @@ class MapillaryClickPreviewPlugin:
         except Exception:
             pass
 
+        try:
+            tool.disable_auto_identify_preview()
+        except Exception:
+            pass
+
         self.coverage_tile_set = None
         self.coverage_range_key = None
         self._remove_coverage_layers()
@@ -271,6 +281,45 @@ class MapillaryClickPreviewPlugin:
         dlg.setModal(True)
         dlg.exec()
 
+    def _on_image_layer_selection_changed(self, selected, deselected, clear_and_select):
+        layer = self._auto_preview_layer
+        if layer is None:
+            return
+
+        try:
+            if layer.selectedFeatureCount() <= 0:
+                return
+            tool.preview_selected_feature()
+        except Exception as e:
+            QgsMessageLog.logMessage(f'Auto preview on selection failed: {e}', 'Mapillary', Qgis.Warning)
+
+    def _connect_auto_preview_layer(self, layer):
+        if layer is self._auto_preview_layer:
+            return
+
+        self._disconnect_auto_preview_layer()
+
+        if layer is None or not layer.isValid():
+            return
+
+        try:
+            layer.selectionChanged.connect(self._on_image_layer_selection_changed)
+            self._auto_preview_layer = layer
+        except Exception as e:
+            QgsMessageLog.logMessage(f'Could not connect selection auto-preview: {e}', 'Mapillary', Qgis.Warning)
+            self._auto_preview_layer = None
+
+    def _disconnect_auto_preview_layer(self):
+        if self._auto_preview_layer is None:
+            return
+
+        try:
+            self._auto_preview_layer.selectionChanged.disconnect(self._on_image_layer_selection_changed)
+        except Exception:
+            pass
+
+        self._auto_preview_layer = None
+
     def _open_year_filter(self):
         dlg = YearFilterDialog(self.iface.mainWindow())
         dlg.setModal(True)
@@ -283,6 +332,8 @@ class MapillaryClickPreviewPlugin:
         self._load_coverage(self.coverage_tile_set)
 
     def _remove_coverage_layers(self):
+        self._disconnect_auto_preview_layer()
+
         for level in LAYER_LEVELS:
             layer = self.coverage_layers.get(level)
             if not layer:
@@ -302,10 +353,17 @@ class MapillaryClickPreviewPlugin:
             to_year = s.value('mapillary/year_filter_to', datetime.now().year, type=int)
             year_expr = _build_year_filter_expr(from_year, to_year)
 
+        target_layer_names = {'Mapillary image', 'Mapillary sequence'}
+
         for layer in QgsProject.instance().mapLayers().values():
-            if not (isinstance(layer, QgsVectorLayer) and layer.name() == 'Mapillary image'):
+            if not (isinstance(layer, QgsVectorLayer) and layer.name() in target_layer_names):
                 continue
-            layer.setSubsetString(year_expr)
+
+            subset = ''
+            if enabled and layer.fields().lookupField('captured_at') != -1:
+                subset = year_expr
+
+            layer.setSubsetString(subset)
             layer.triggerRepaint()
 
     def _load_coverage(self, tile_set='original', force=False):
@@ -390,15 +448,7 @@ class MapillaryClickPreviewPlugin:
             for level in LAYER_LEVELS:
                 lyr = layers[level]
                 if lyr and lyr.isValid():
-                    if level == 'image':
-                        qml_candidates = [
-                            os.path.join(os.path.dirname(__file__), 'Mapillary image.qml'),
-                            os.path.join(os.path.dirname(__file__), 'res', 'mapillary_image.qml'),
-                        ]
-                    else:
-                        qml_candidates = [
-                            os.path.join(os.path.dirname(__file__), 'res', f'mapillary_{level}.qml')
-                        ]
+                    qml_candidates = [os.path.join(os.path.dirname(__file__), 'res', f'mapillary_{level}.qml')]
 
                     for qml in qml_candidates:
                         if os.path.exists(qml):
@@ -413,10 +463,12 @@ class MapillaryClickPreviewPlugin:
 
             if added:
                 self._apply_year_filter_to_existing_layers()
+                self._connect_auto_preview_layer(self.coverage_layers.get('image'))
                 QgsMessageLog.logMessage(
                     f'Mapillary coverage loaded: {len(added)} layer(s) at zoom {zoom_level}.',
                     'Mapillary', Qgis.Info)
             else:
+                self._disconnect_auto_preview_layer()
                 QgsMessageLog.logMessage(
                     'No Mapillary coverage tiles found for current extent.', 'Mapillary', Qgis.Warning)
         finally:
