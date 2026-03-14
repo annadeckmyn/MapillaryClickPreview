@@ -24,7 +24,7 @@ _SERVER_URLS = {
     'original': 'https://tiles.mapillary.com/maps/vtp/mly1_public/2/{z}/{x}/{y}?access_token={token}',
     'computed': 'https://tiles.mapillary.com/maps/vtp/mly1_computed_public/2/{z}/{x}/{y}?access_token={token}',
 }
-LAYER_LEVELS = ['image', 'overview', 'sequence']
+LAYER_LEVELS = ['image', 'sequence']
 CACHE_EXPIRE_HOURS = 24
 _CACHE_EXPIRE = timedelta(hours=CACHE_EXPIRE_HOURS)
 MAX_WEB_MERCATOR_LAT = 85.05112878
