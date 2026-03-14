@@ -2,21 +2,99 @@
 # -*- coding: utf-8 -*-
 # QGIS Plugin: Mapillary Click Preview (toggle button + add coverage VTP layer)
 
-import json
+import math
 import os
-from datetime import datetime, timezone
-from qgis.PyQt.QtCore import Qt
+import tempfile
+from datetime import datetime, timedelta, timezone
+import requests
 from qgis.PyQt.QtGui import QIcon
 from qgis.PyQt.QtWidgets import (
     QAction, QCheckBox, QDialog, QDialogButtonBox, QFormLayout, QLineEdit, QSpinBox,
 )
-from qgis.core import QgsSettings, QgsProject, QgsVectorTileBasicRenderer, QgsVectorTileLayer
+from qgis.core import (
+    QgsSettings, QgsProject, QgsVectorLayer,
+    QgsCoordinateReferenceSystem, QgsCoordinateTransform, QgsPointXY,
+    QgsMessageLog, Qgis,
+)
 
 from . import mapillary_click_tool as tool
 
 
-TILES_TEMPLATE = 'https://tiles.mapillary.com/maps/vtp/mly1_public/2/{{z}}/{{x}}/{{y}}?access_token={token}'
+_SERVER_URLS = {
+    'original': 'https://tiles.mapillary.com/maps/vtp/mly1_public/2/{z}/{x}/{y}?access_token={token}',
+    'computed': 'https://tiles.mapillary.com/maps/vtp/mly1_computed_public/2/{z}/{x}/{y}?access_token={token}',
+}
+LAYER_LEVELS = ['image', 'overview', 'sequence']
+CACHE_EXPIRE_HOURS = 24
+_CACHE_EXPIRE = timedelta(hours=CACHE_EXPIRE_HOURS)
+MAX_WEB_MERCATOR_LAT = 85.05112878
 MAPILLARY_LAUNCH_YEAR = 2012
+
+
+def _is_finite_number(value):
+    try:
+        return math.isfinite(float(value))
+    except (TypeError, ValueError):
+        return False
+
+
+def _clamp(value, minimum, maximum):
+    return max(minimum, min(value, maximum))
+
+
+def _deg2num(lat_deg, lon_deg, zoom):
+    lat_deg = _clamp(float(lat_deg), -MAX_WEB_MERCATOR_LAT, MAX_WEB_MERCATOR_LAT)
+    lon_deg = _clamp(float(lon_deg), -180.0, 179.999999999)
+    lat_rad = math.radians(lat_deg)
+    n = 2.0 ** zoom
+    x = int((lon_deg + 180.0) / 360.0 * n)
+    y = int((1.0 - math.log(math.tan(lat_rad) + (1.0 / math.cos(lat_rad))) / math.pi) / 2.0 * n)
+    return x, y
+
+
+def _zoom_for_pixel_size(pixel_size):
+    for i in range(30):
+        if pixel_size > (180 / 256.0 / 2 ** i):
+            return i - 1 if i != 0 else 0
+    return 29
+
+
+def _get_tile_range(bounds, zoom):
+    xm, ym, xmx, ymx = bounds
+    start = _deg2num(ymx, xm, zoom)
+    end = _deg2num(ym, xmx, zoom)
+    return (min(start[0], end[0]), max(start[0], end[0])), (min(start[1], end[1]), max(start[1], end[1]))
+
+
+def _build_tile_url(x, y, z, template):
+    return template.replace('{x}', str(x)).replace('{y}', str(y)).replace('{z}', str(z))
+
+
+def _get_proxies():
+    from qgis.PyQt.QtCore import QSettings
+    s = QSettings()
+    if s.value('proxy/proxyEnabled', '') != 'true':
+        return None
+    host = s.value('proxy/proxyHost', '')
+    port = s.value('proxy/proxyPort', '')
+    user = s.value('proxy/proxyUser', '')
+    pwd = s.value('proxy/proxyPassword', '')
+    scheme = 'socks5' if s.value('proxy/proxyType', '') == 'Socks5Proxy' else 'http'
+    addr = f'{scheme}://{user}:{pwd}@{host}:{port}'
+    return {'http': addr, 'https': addr}
+
+
+def _extend_layer(target, source, name):
+    if not target:
+        wkb_map = {0: 'UnknownType', 1: 'Point', 2: 'LineString', 3: 'Polygon',
+                   4: 'MultiPoint', 5: 'MultiLineString', 6: 'MultiPolygon'}
+        geom_type = wkb_map.get(int(source.wkbType()), 'UnknownType')
+        crs = source.crs().toWkt()
+        target = QgsVectorLayer(f'{geom_type}?crs={crs}', name, 'memory')
+        target.dataProvider().addAttributes(source.fields())
+        target.updateFields()
+    target.dataProvider().addFeatures(list(source.getFeatures()))
+    return target
 
 
 class TokenDialog(QDialog):
@@ -106,7 +184,12 @@ class MapillaryClickPreviewPlugin:
         self.action = None
         self.settings_action = None
         self.add_tiles_action = None
+        self.add_computed_tiles_action = None
         self.filter_year_action = None
+        self.coverage_tile_set = None
+        self.coverage_range_key = None
+        self.coverage_layers = {level: None for level in LAYER_LEVELS}
+        self.coverage_refreshing = False
 
     def initGui(self):
         icon_path = os.path.join(os.path.dirname(__file__), 'icon.svg')
@@ -120,19 +203,35 @@ class MapillaryClickPreviewPlugin:
         self.settings_action = QAction('Mapillary Token…', self.iface.mainWindow())
         self.settings_action.triggered.connect(self._open_settings)
 
-        self.add_tiles_action = QAction('Add Mapillary Coverage (Vector Tiles)', self.iface.mainWindow())
-        self.add_tiles_action.triggered.connect(self._add_vector_tiles_layer)
+        self.add_tiles_action = QAction('Load Mapillary Coverage (Original)', self.iface.mainWindow())
+        self.add_tiles_action.triggered.connect(
+            lambda: self._load_coverage('original', force=True))
+
+        self.add_computed_tiles_action = QAction('Load Mapillary Coverage (Computed)', self.iface.mainWindow())
+        self.add_computed_tiles_action.triggered.connect(
+            lambda: self._load_coverage('computed', force=True))
 
         self.iface.addToolBarIcon(self.action)
         self.iface.addPluginToMenu('&Mapillary', self.action)
         self.iface.addPluginToMenu('&Mapillary', self.settings_action)
         self.iface.addPluginToMenu('&Mapillary', self.add_tiles_action)
+        self.iface.addPluginToMenu('&Mapillary', self.add_computed_tiles_action)
 
         self.filter_year_action = QAction('Filter Mapillary Coverage by Year…', self.iface.mainWindow())
         self.filter_year_action.triggered.connect(self._open_year_filter)
         self.iface.addPluginToMenu('&Mapillary', self.filter_year_action)
 
+        try:
+            self.iface.mapCanvas().mapCanvasRefreshed.connect(self._refresh_coverage_for_canvas)
+        except Exception:
+            pass
+
     def unload(self):
+        try:
+            self.iface.mapCanvas().mapCanvasRefreshed.disconnect(self._refresh_coverage_for_canvas)
+        except Exception:
+            pass
+
         try:
             if self.action:
                 self.iface.removeToolBarIcon(self.action)
@@ -141,6 +240,8 @@ class MapillaryClickPreviewPlugin:
                 self.iface.removePluginMenu('&Mapillary', self.settings_action)
             if self.add_tiles_action:
                 self.iface.removePluginMenu('&Mapillary', self.add_tiles_action)
+            if self.add_computed_tiles_action:
+                self.iface.removePluginMenu('&Mapillary', self.add_computed_tiles_action)
             if self.filter_year_action:
                 self.iface.removePluginMenu('&Mapillary', self.filter_year_action)
         except Exception:
@@ -151,6 +252,10 @@ class MapillaryClickPreviewPlugin:
         except Exception:
             pass
 
+        self.coverage_tile_set = None
+        self.coverage_range_key = None
+        self._remove_coverage_layers()
+
     def _on_toggled(self, checked):
         try:
             if checked:
@@ -159,7 +264,6 @@ class MapillaryClickPreviewPlugin:
                 tool.deactivate_click_tool(show_message=False)
         except Exception as e:
             self.action.setChecked(False)
-            from qgis.core import QgsMessageLog, Qgis
             QgsMessageLog.logMessage(f'Error toggling Mapillary tool: {e}', 'Mapillary', Qgis.Critical)
 
     def _open_settings(self):
@@ -173,6 +277,22 @@ class MapillaryClickPreviewPlugin:
         if dlg.exec() == QDialog.DialogCode.Accepted:
             self._apply_year_filter_to_existing_layers()
 
+    def _refresh_coverage_for_canvas(self):
+        if not self.coverage_tile_set or self.coverage_refreshing:
+            return
+        self._load_coverage(self.coverage_tile_set)
+
+    def _remove_coverage_layers(self):
+        for level in LAYER_LEVELS:
+            layer = self.coverage_layers.get(level)
+            if not layer:
+                continue
+            try:
+                QgsProject.instance().removeMapLayer(layer.id())
+            except Exception:
+                pass
+            self.coverage_layers[level] = None
+
     def _apply_year_filter_to_existing_layers(self):
         s = QgsSettings()
         enabled = s.value('mapillary/year_filter_enabled', False, type=bool)
@@ -182,63 +302,122 @@ class MapillaryClickPreviewPlugin:
             to_year = s.value('mapillary/year_filter_to', datetime.now().year, type=int)
             year_expr = _build_year_filter_expr(from_year, to_year)
 
-        _ORIG_KEY = 'mapillary_year_filter_originals'
         for layer in QgsProject.instance().mapLayers().values():
-            if not (isinstance(layer, QgsVectorTileLayer) and layer.name() == 'Mapillary Coverage (mly1_public)'):
+            if not (isinstance(layer, QgsVectorLayer) and layer.name() == 'Mapillary image'):
                 continue
-            renderer = layer.renderer()
-            if not isinstance(renderer, QgsVectorTileBasicRenderer):
-                continue
-            if hasattr(renderer, 'styles'):
-                rules = renderer.styles()
-            else:
-                rules = renderer.rules()
-
-            # Persist original (pre-filter) rule expressions on first encounter
-            saved_raw = layer.customProperty(_ORIG_KEY)
-            if saved_raw:
-                try:
-                    originals = json.loads(saved_raw)
-                except Exception:
-                    originals = [r.filterExpression() for r in rules]
-                    layer.setCustomProperty(_ORIG_KEY, json.dumps(originals))
-            else:
-                originals = [r.filterExpression() for r in rules]
-                layer.setCustomProperty(_ORIG_KEY, json.dumps(originals))
-
-            for i, rule in enumerate(rules):
-                base = originals[i] if i < len(originals) else ''
-                if year_expr:
-                    new_filter = f'({base}) AND ({year_expr})' if base else year_expr
-                else:
-                    new_filter = base
-                rule.setFilterExpression(new_filter)
-
-            if hasattr(renderer, 'setStyles'):
-                renderer.setStyles(rules)
-            else:
-                renderer.setRules(rules)
+            layer.setSubsetString(year_expr)
             layer.triggerRepaint()
 
-    def _add_vector_tiles_layer(self):
+    def _load_coverage(self, tile_set='original', force=False):
         s = QgsSettings()
         token = s.value('mapillary/access_token', '', type=str).strip()
         if not token:
-            # Prompt for token first
             self._open_settings()
             token = s.value('mapillary/access_token', '', type=str).strip()
             if not token:
-                from qgis.core import QgsMessageLog, Qgis
-                QgsMessageLog.logMessage('No Mapillary token set. Cannot add vector tiles layer.', 'Mapillary', Qgis.Warning)
+                QgsMessageLog.logMessage('No Mapillary token set.', 'Mapillary', Qgis.Warning)
                 return
 
-        url = TILES_TEMPLATE.format(token=token)
-        # QGIS Vector Tile URI uses provider options style: type=xyz&url=... (see docs)
-        uri = f'type=xyz&url={url}'
-        vtl = QgsVectorTileLayer(uri, 'Mapillary Coverage (mly1_public)')
-        if not vtl.isValid():
-            from qgis.core import QgsMessageLog, Qgis
-            QgsMessageLog.logMessage('Failed to create Mapillary coverage vector tile layer. Check URL/token.', 'Mapillary', Qgis.Critical)
+        server_url = _SERVER_URLS[tile_set].replace('{token}', token)
+
+        canvas = self.iface.mapCanvas()
+        crs_src = canvas.mapSettings().destinationCrs()
+        crs_wgs84 = QgsCoordinateReferenceSystem(4326)
+        xform = QgsCoordinateTransform(crs_src, crs_wgs84, QgsProject.instance())
+
+        ex = canvas.extent()
+        wgs84_min = xform.transform(QgsPointXY(ex.xMinimum(), ex.yMinimum()))
+        wgs84_max = xform.transform(QgsPointXY(ex.xMaximum(), ex.yMaximum()))
+        bounds = (wgs84_min.x(), wgs84_min.y(), wgs84_max.x(), wgs84_max.y())
+
+        if not all(_is_finite_number(v) for v in bounds):
+            QgsMessageLog.logMessage('Canvas extent is not valid for tile loading.', 'Mapillary', Qgis.Warning)
             return
-        QgsProject.instance().addMapLayer(vtl)
-        self._apply_year_filter_to_existing_layers()
+
+        canvas_width = canvas.width()
+        if canvas_width <= 0:
+            return
+        map_units_per_pixel = abs(wgs84_max.x() - wgs84_min.x()) / canvas_width
+        zoom_level = _zoom_for_pixel_size(map_units_per_pixel)
+        zoom_level = max(0, min(int(zoom_level), 14))
+
+        try:
+            x_range, y_range = _get_tile_range(bounds, zoom_level)
+        except (ValueError, OverflowError) as e:
+            QgsMessageLog.logMessage(f'Could not compute tile range: {e}', 'Mapillary', Qgis.Warning)
+            return
+
+        range_key = (tile_set, zoom_level, x_range[0], x_range[1], y_range[0], y_range[1])
+        if not force and range_key == self.coverage_range_key:
+            return
+
+        self.coverage_refreshing = True
+        try:
+            cache_dir = os.path.join(tempfile.gettempdir(), 'go2mapillary')
+            layers = {level: None for level in LAYER_LEVELS}
+
+            for x in range(x_range[0], x_range[1] + 1):
+                for y in range(y_range[0], y_range[1] + 1):
+                    folder = os.path.join(cache_dir, str(zoom_level), str(x))
+                    os.makedirs(folder, exist_ok=True)
+                    mvt_path = os.path.join(folder, f'{y}.mvt')
+
+                    expired = (
+                        not os.path.exists(mvt_path) or
+                        datetime.fromtimestamp(os.path.getmtime(mvt_path)) < (datetime.now() - _CACHE_EXPIRE)
+                    )
+                    if expired:
+                        url = _build_tile_url(x, y, zoom_level, server_url)
+                        try:
+                            resp = requests.get(url, proxies=_get_proxies(), timeout=15)
+                            resp.raise_for_status()
+                            with open(mvt_path, 'wb') as f:
+                                f.write(resp.content)
+                        except Exception as e:
+                            QgsMessageLog.logMessage(
+                                f'Tile download failed [{x},{y},{zoom_level}]: {e}', 'Mapillary', Qgis.Warning)
+                            continue
+
+                    if os.path.exists(mvt_path):
+                        for level in LAYER_LEVELS:
+                            tile = QgsVectorLayer(f'{mvt_path}|layername={level}', level, 'ogr')
+                            if tile.isValid():
+                                layers[level] = _extend_layer(layers[level], tile, f'Mapillary {level}')
+
+            self._remove_coverage_layers()
+
+            added = []
+            for level in LAYER_LEVELS:
+                lyr = layers[level]
+                if lyr and lyr.isValid():
+                    if level == 'image':
+                        qml_candidates = [
+                            os.path.join(os.path.dirname(__file__), 'Mapillary image.qml'),
+                            os.path.join(os.path.dirname(__file__), 'res', 'mapillary_image.qml'),
+                        ]
+                    else:
+                        qml_candidates = [
+                            os.path.join(os.path.dirname(__file__), 'res', f'mapillary_{level}.qml')
+                        ]
+
+                    for qml in qml_candidates:
+                        if os.path.exists(qml):
+                            lyr.loadNamedStyle(qml)
+                            break
+                    QgsProject.instance().addMapLayer(lyr)
+                    self.coverage_layers[level] = lyr
+                    added.append(lyr)
+
+            self.coverage_tile_set = tile_set
+            self.coverage_range_key = range_key
+
+            if added:
+                self._apply_year_filter_to_existing_layers()
+                QgsMessageLog.logMessage(
+                    f'Mapillary coverage loaded: {len(added)} layer(s) at zoom {zoom_level}.',
+                    'Mapillary', Qgis.Info)
+            else:
+                QgsMessageLog.logMessage(
+                    'No Mapillary coverage tiles found for current extent.', 'Mapillary', Qgis.Warning)
+        finally:
+            self.coverage_refreshing = False
