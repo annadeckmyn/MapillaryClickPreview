@@ -16,4 +16,4 @@ tags=mapillary,vector tiles,imagery,web
 homepage=https://github.com/annadeckmyn/MapillaryClickPreview
 repository=https://github.com/annadeckmyn/MapillaryClickPreview
 tracker=https://github.com/annadeckmyn/MapillaryClickPreview
-changelog=Adds original and computed coverage loaders; adds captured_at year-range filtering; adds auto-preview for Mapillary image selection and Identify clicks; improves docked thumbnail/metadata preview; keeps tile cache in %TEMP%\\go2mapillary for up to 24 hours.
+changelog=Adds original and computed coverage loaders; adds captured_at year-range filtering; adds auto-preview for Mapillary image selection and Identify clicks; improves docked thumbnail/metadata preview; keeps tile cache in %%TEMP%%\\go2mapillary for up to 24 hours.

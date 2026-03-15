@@ -421,8 +421,7 @@ class MapillaryClickPreviewPlugin:
                     mvt_path = os.path.join(folder, f'{y}.mvt')
 
                     expired = (
-                        not os.path.exists(mvt_path) or
-                        datetime.fromtimestamp(os.path.getmtime(mvt_path)) < (datetime.now() - _CACHE_EXPIRE)
+                        not os.path.exists(mvt_path) or datetime.fromtimestamp(os.path.getmtime(mvt_path)) < (datetime.now() - _CACHE_EXPIRE)
                     )
                     if expired:
                         url = _build_tile_url(x, y, zoom_level, server_url)

@@ -7,6 +7,7 @@
 from datetime import datetime, timezone
 import json
 import urllib.error
+import urllib.parse
 import urllib.request
 
 from qgis.PyQt.QtCore import QEvent, QObject, Qt
@@ -32,6 +33,7 @@ MAPILLARY_IMAGE_LAYER_NAME = 'Mapillary image'
 MAPILLARY_ID_FIELD = 'id'
 FEATURE_PICK_TOLERANCE_PX = 8
 THUMB_MAX_W, THUMB_MAX_H = 900, 600
+ALLOWED_REMOTE_URL_SCHEME = 'https'
 
 canvas = None
 project = None
@@ -76,9 +78,37 @@ class _MapillaryIdentifyClickFilter(QObject):
         return False
 
 
+def _validate_remote_url(url):
+    if not isinstance(url, str):
+        raise RuntimeError('Ongeldige URL ontvangen.')
+
+    candidate = url.strip()
+    if not candidate:
+        raise RuntimeError('Ongeldige URL ontvangen.')
+
+    parsed = urllib.parse.urlsplit(candidate)
+    if parsed.scheme.lower() != ALLOWED_REMOTE_URL_SCHEME or not parsed.netloc:
+        raise RuntimeError('Alleen absolute https-URLs zijn toegestaan.')
+
+    return parsed.geturl()
+
+
+class _HttpsOnlyRedirectHandler(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        absolute_redirect_url = urllib.parse.urljoin(req.full_url, newurl)
+        safe_redirect_url = _validate_remote_url(absolute_redirect_url)
+        return super().redirect_request(req, fp, code, msg, headers, safe_redirect_url)
+
+
+def _open_remote_url(url, timeout):
+    safe_url = _validate_remote_url(url)
+    opener = urllib.request.build_opener(_HttpsOnlyRedirectHandler())
+    req = urllib.request.Request(safe_url)
+    return opener.open(req, timeout=timeout)
+
+
 def fetch_json(url):
-    req = urllib.request.Request(url)
-    with urllib.request.urlopen(req, timeout=60) as resp:
+    with _open_remote_url(url, timeout=60) as resp:
         return json.loads(resp.read().decode('utf-8'))
 
 
@@ -344,8 +374,7 @@ def fetch_pixmap_from_url(url):
     if not url:
         return None
     try:
-        req = urllib.request.Request(url)
-        with urllib.request.urlopen(req, timeout=30) as resp:
+        with _open_remote_url(url, timeout=30) as resp:
             data = resp.read()
         pix = QPixmap()
         if pix.loadFromData(data):
@@ -562,3 +591,4 @@ def activate_click_tool():
 
     globals()['_MAPILLARY_CLICK_TOOL'] = click_tool
     globals()['_MAPILLARY_CLICK_HANDLER'] = on_canvas_clicked
+    
