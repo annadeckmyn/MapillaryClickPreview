@@ -1,13 +1,13 @@
 
 [general]
 name=MapillaryClickPreview
-description=Click-to-preview nearest Mapillary image and add Mapillary coverage as vector tiles.
+description=Preview nearest Mapillary image from map clicks and load original/computed Mapillary coverage layers with optional year filtering.
 qgisMinimumVersion=4.0
 qgisMaximumVersion=4.99
-version=1.1.1
+version=1.2.0
 author=Anna Deckmyn
 email=anna.deckmyn@gmail.com
-about=Toggle tool to fetch and preview the nearest Mapillary image by clicking on the map canvas. Includes an action to add Mapillary coverage vector tiles (mly1_public).
+about=Toggle click-only preview to fetch the nearest Mapillary image from the Mapillary image layer and show a docked thumbnail, metadata, and Mapillary link. Includes coverage loaders for mly1_public and mly1_computed_public, auto-preview on layer selection and Identify clicks, extent-based coverage refresh, and an optional captured_at year filter.
 experimental=False
 deprecated=False
 category=Web
@@ -16,4 +16,4 @@ tags=mapillary,vector tiles,imagery,web
 homepage=https://github.com/annadeckmyn/MapillaryClickPreview
 repository=https://github.com/annadeckmyn/MapillaryClickPreview
 tracker=https://github.com/annadeckmyn/MapillaryClickPreview
-changelog=Qt6 fixes; adds menu action to create a Vector Tile layer (mly1_public) using token from QgsSettings.
+changelog=Adds original and computed coverage loaders; adds captured_at year-range filtering; adds auto-preview for Mapillary image selection and Identify clicks; improves docked thumbnail/metadata preview; keeps tile cache in %TEMP%\\go2mapillary for up to 24 hours.
