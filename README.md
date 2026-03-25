@@ -19,7 +19,7 @@ QGIS plugin to load Mapillary coverage and preview the nearest Mapillary image f
 
 ## Requirements
 
-- QGIS `>= 4.0` and `< 5.0` (from plugin metadata)
+- QGIS `>= 3.44` and `< 5.0` (from plugin metadata; includes QGIS 3.44.7)
 - Internet access for Mapillary API and tiles
 - A Mapillary access token
 
@@ -31,9 +31,12 @@ QGIS plugin to load Mapillary coverage and preview the nearest Mapillary image f
 
 Typical plugin directories:
 
-- Windows: `%APPDATA%\\QGIS\\QGIS4\\profiles\\default\\python\\plugins`
-- Linux: `~/.local/share/QGIS/QGIS4/profiles/default/python/plugins`
-- macOS: `~/Library/Application Support/QGIS/QGIS4/profiles/default/python/plugins`
+- Windows (QGIS 3.x): `%APPDATA%\\QGIS\\QGIS3\\profiles\\default\\python\\plugins`
+- Windows (QGIS 4.x): `%APPDATA%\\QGIS\\QGIS4\\profiles\\default\\python\\plugins`
+- Linux (QGIS 3.x): `~/.local/share/QGIS/QGIS3/profiles/default/python/plugins`
+- Linux (QGIS 4.x): `~/.local/share/QGIS/QGIS4/profiles/default/python/plugins`
+- macOS (QGIS 3.x): `~/Library/Application Support/QGIS/QGIS3/profiles/default/python/plugins`
+- macOS (QGIS 4.x): `~/Library/Application Support/QGIS/QGIS4/profiles/default/python/plugins`
 
 ## First-Time Setup
 
